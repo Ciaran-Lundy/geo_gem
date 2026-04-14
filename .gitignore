@@ -1,0 +1,29 @@
+node_modules/
+.env
+data/iml1515.json
+data/entity_id_map.json
+data/publish_log.json
+*.pyc                                                                                     
+*.pyo
+venv/                                                                                          
+# Node                                                  
+node_modules/               
+                       
+# Data files — large, generated, or sensitive
+data/iml1515.json
+data/keio_perturbations.json
+data/entity_id_map.json            
+data/publish_log.json
+data/escher_maps/
+                       
+# Temp files from the SBML download
+/tmp/
+        
+# Environment / secrets
+.env  
+     
+# Editor
+.vscode/
+.idea/        
+*.swp                                                              
+*.swo  

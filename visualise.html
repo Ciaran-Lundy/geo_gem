@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>iML1515 — Metabolic Network</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src="./node_modules/cytoscape/dist/cytoscape.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0f1117; color: #e2e8f0; font-family: system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }
+
+    header { padding: 1rem 2rem; border-bottom: 1px solid #1e2533; flex-shrink: 0; display: flex; align-items: center; gap: 1.5rem; }
+    header h1 { font-size: 1.1rem; font-weight: 600; }
+    header p  { font-size: 0.78rem; color: #64748b; }
+
+    .tab-bar { display: flex; border: 1px solid #2d3748; border-radius: 5px; overflow: hidden; flex-shrink: 0; }
+    .tab-bar button {
+      background: #1e2533; border: none; color: #94a3b8;
+      padding: 0.35rem 1.1rem; font-size: 0.78rem; cursor: pointer;
+      border-right: 1px solid #2d3748;
+    }
+    .tab-bar button:last-child { border-right: none; }
+    .tab-bar button.active { background: #3b82f6; color: #fff; font-weight: 600; }
+
+    #controls {
+      display: flex; gap: 1.5rem; align-items: center; flex-wrap: wrap;
+      padding: 0.75rem 2rem; background: #131720;
+      border-bottom: 1px solid #1e2533; flex-shrink: 0;
+    }
+    .ctrl { display: flex; flex-direction: column; gap: 0.25rem; }
+    .ctrl label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; }
+    select {
+      background: #1e2533; border: 1px solid #2d3748; border-radius: 4px;
+      color: #e2e8f0; padding: 0.3rem 0.55rem; font-size: 0.8rem; min-width: 200px;
+    }
+    .range-wrap { display: flex; align-items: center; gap: 0.5rem; }
+    input[type=range] { accent-color: #3b82f6; width: 120px; }
+    .range-val { font-size: 0.82rem; color: #60a5fa; font-weight: 600; min-width: 2.5ch; }
+
+    #legend { display: flex; gap: 0.9rem; flex-wrap: wrap; align-items: center; }
+    .leg-item { display: flex; align-items: center; gap: 0.3rem; font-size: 0.73rem; color: #94a3b8; }
+    .leg-swatch { width: 9px; height: 9px; border-radius: 2px; flex-shrink: 0; }
+
+    #flux-legend { display: none; align-items: center; gap: 0.5rem; font-size: 0.7rem; color: #94a3b8; }
+    #flux-legend.visible { display: flex; }
+    #flux-grad { width: 100px; height: 9px; border-radius: 3px; background: linear-gradient(to right, #ef4444, #475569, #3b82f6); }
+
+    #chart {
+      flex: 1; display: flex; justify-content: center; align-items: center;
+      overflow: hidden; position: relative;
+    }
+    #chart svg { overflow: visible; }
+
+    /* Chord */
+    .group path { cursor: pointer; transition: opacity 0.15s; }
+    .ribbons path { transition: opacity 0.15s; }
+    .ribbons path:hover { opacity: 1 !important; }
+
+    /* Cytoscape container */
+    #cy { width: 100%; height: 100%; position: absolute; inset: 0; background: #0f1117; }
+
+    #tooltip {
+      position: fixed; pointer-events: none;
+      background: #1a2030; border: 1px solid #2d3748; border-radius: 6px;
+      padding: 0.55rem 0.8rem; font-size: 0.77rem; line-height: 1.65;
+      max-width: 280px; display: none; z-index: 100;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    }
+    #tooltip strong { color: #60a5fa; }
+    #tooltip .sub  { color: #94a3b8; margin-top: 0.15rem; font-size: 0.73rem; }
+    #tooltip .flux-up   { color: #ef4444; }
+    #tooltip .flux-down { color: #3b82f6; }
+    #tooltip .flux-flat { color: #64748b; }
+
+    #status { color: #64748b; font-size: 0.9rem; }
+    #keio-badge {
+      font-size: 0.69rem; padding: 0.12rem 0.45rem; border-radius: 3px;
+      background: #1e2533; color: #64748b; border: 1px solid #2d3748;
+    }
+    #keio-badge.loaded { color: #10b981; border-color: #10b981; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>iML1515 E. coli — Metabolic Network</h1>
+    <p>Flux perturbation from Keio gene-knockout fitness data vs glucose baseline.</p>
+  </div>
+  <div class="tab-bar">
+    <button class="tab active" data-view="chord">Chord Diagram</button>
+    <button class="tab"        data-view="escher">Escher Flux Map</button>
+  </div>
+</header>
+
+<div id="controls">
+  <!-- Chord-only controls -->
+  <div class="ctrl" id="ctrl-subsystem">
+    <label>Subsystem</label>
+    <select id="sel-subsystem"></select>
+  </div>
+  <div class="ctrl" id="ctrl-topN">
+    <label>Top metabolites</label>
+    <div class="range-wrap">
+      <input type="range" id="rng-topN" min="4" max="80" value="30">
+      <span class="range-val" id="val-topN">30</span>
+    </div>
+  </div>
+  <div class="ctrl" id="ctrl-compartment">
+    <label>Compartment</label>
+    <select id="sel-compartment"><option value="">All</option></select>
+  </div>
+  <!-- Escher-only controls -->
+  <div class="ctrl" id="ctrl-escher-map" style="display:none">
+    <label>Pathway map (iJO1366)</label>
+    <select id="sel-escher-map"></select>
+  </div>
+  <!-- Shared controls -->
+  <div class="ctrl" id="ctrl-condition" style="display:none">
+    <label>Keio condition vs glucose</label>
+    <select id="sel-condition"></select>
+  </div>
+  <div class="ctrl" id="ctrl-threshold" style="display:none">
+    <label>Flux threshold</label>
+    <div class="range-wrap">
+      <input type="range" id="rng-threshold" min="1" max="20" value="5">
+      <span class="range-val" id="val-threshold">0.5</span>
+    </div>
+  </div>
+  <div id="flux-legend">
+    <span>more active</span><div id="flux-grad"></div><span>less active</span>
+  </div>
+  <span id="keio-badge">Keio: loading…</span>
+  <div id="legend"></div>
+</div>
+
+<div id="chart"><div id="status">Loading data…</div></div>
+<div id="tooltip"></div>
+
+<script>
+// ── Constants ─────────────────────────────────────────────────────────────────
+const COMP_NAMES  = { c:'Cytoplasm', e:'Extracellular', p:'Periplasm', m:'Mitochondria', x:'Peroxisome', n:'Nucleus' };
+const COMP_COLORS = { c:'#3b82f6', e:'#f59e0b', p:'#10b981', m:'#8b5cf6', x:'#ef4444', n:'#ec4899' };
+const FALLBACK    = '#64748b';
+
+const ESCHER_MAPS = [
+  { key: 'central_metabolism',          label: 'Central Metabolism'              },
+  { key: 'fatty_acid_beta_oxidation',   label: 'Fatty Acid β-Oxidation'          },
+  { key: 'fatty_acid_biosynthesis',     label: 'Fatty Acid Biosynthesis'         },
+  { key: 'nucleotide_metabolism',       label: 'Nucleotide Metabolism'           },
+  { key: 'nucleotide_histidine_biosyn', label: 'Nucleotide & Histidine Biosyn.'  },
+];
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let gem         = null;
+let keio        = null;
+let activeView  = 'chord';
+const escherMapCache = {};
+
+// ── Flux helpers ──────────────────────────────────────────────────────────────
+const fluxThreshold  = () => +document.getElementById('rng-threshold').value / 10;
+const activeCondition = () => document.getElementById('sel-condition')?.value ?? '__none__';
+const inFluxMode     = () => keio && activeCondition() !== '__none__';
+
+function rxnDelta(rxnId) {
+  if (!inFluxMode()) return null;
+  const s = keio.reaction_scores[rxnId];
+  if (!s) return null;
+  const sc = s[activeCondition()], sb = s[keio.baseline];
+  return (sc != null && sb != null) ? sc - sb : null;
+}
+
+function fluxColor(delta) {
+  if (delta == null || isNaN(delta)) return FALLBACK;
+  const t = Math.min(Math.abs(delta) / 2, 1);
+  if (Math.abs(delta) < fluxThreshold()) return '#475569';
+  return delta < 0
+    ? d3.interpolateRgb('#475569', '#ef4444')(t)
+    : d3.interpolateRgb('#475569', '#3b82f6')(t);
+}
+
+function ribbonDelta(rxnIds) {
+  const ds = rxnIds.map(rxnDelta).filter(d => d != null);
+  return ds.length ? ds.reduce((a, b) => a + b) / ds.length : null;
+}
+
+function fluxLabel(delta) {
+  if (!inFluxMode()) return '';
+  if (delta == null) return '<span class="flux-flat">no Keio data</span>';
+  const [cls, txt] = delta < -fluxThreshold()
+    ? ['flux-up',   `▲ more active (Δ ${delta.toFixed(2)})`]
+    : delta > fluxThreshold()
+    ? ['flux-down', `▼ less active (Δ +${delta.toFixed(2)})`]
+    : ['flux-flat', `≈ unchanged (Δ ${delta.toFixed(2)})`];
+  return `<span class="${cls}">${txt}</span>`;
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+async function init() {
+  try {
+    gem = await fetch('./data/iml1515.json').then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    });
+  } catch (e) {
+    document.getElementById('status').textContent =
+      `Could not load model: ${e.message}. Serve via HTTP (npm run visualise).`;
+    return;
+  }
+
+  // Keio (optional)
+  const badge = document.getElementById('keio-badge');
+  try {
+    keio = await fetch('./data/keio_perturbations.json').then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    });
+    badge.textContent = `Keio: ${keio.conditions.length} conditions`;
+    badge.classList.add('loaded');
+    buildConditionDropdown();
+    document.getElementById('ctrl-condition').style.display = '';
+    document.getElementById('ctrl-threshold').style.display = '';
+  } catch (_) { badge.textContent = 'Keio: not loaded'; }
+
+  // Subsystem dropdown
+  const subsystems = [...new Set(gem.reactions.map(r => r.subsystem).filter(Boolean))].sort();
+  const selSys = document.getElementById('sel-subsystem');
+  for (const s of subsystems) {
+    const o = document.createElement('option');
+    o.value = o.textContent = s; selSys.appendChild(o);
+  }
+  selSys.value = subsystems.find(s => /glycolysis/i.test(s)) ?? subsystems[0];
+
+  // Compartment dropdown
+  const comps = [...new Set(gem.metabolites.map(m => m.compartment))].sort();
+  const selComp = document.getElementById('sel-compartment');
+  for (const c of comps) {
+    const o = document.createElement('option');
+    o.value = c; o.textContent = COMP_NAMES[c] ?? c; selComp.appendChild(o);
+  }
+
+  // Escher map dropdown
+  const selEscher = document.getElementById('sel-escher-map');
+  for (const m of ESCHER_MAPS) {
+    const o = document.createElement('option');
+    o.value = m.key; o.textContent = m.label; selEscher.appendChild(o);
+  }
+
+  // Compartment legend
+  const legend = document.getElementById('legend');
+  for (const c of comps) legend.insertAdjacentHTML('beforeend', `
+    <div class="leg-item">
+      <div class="leg-swatch" style="background:${COMP_COLORS[c]??FALLBACK}"></div>
+      ${COMP_NAMES[c]??c}
+    </div>`);
+
+  // Wire controls
+  selSys.addEventListener('change', render);
+  selComp.addEventListener('change', render);
+  selEscher.addEventListener('change', render);
+  document.getElementById('rng-topN').addEventListener('input', e => {
+    document.getElementById('val-topN').textContent = e.target.value; render();
+  });
+  document.getElementById('rng-threshold').addEventListener('input', e => {
+    document.getElementById('val-threshold').textContent = (+e.target.value/10).toFixed(1); render();
+  });
+  document.getElementById('sel-condition')?.addEventListener('change', () => {
+    document.getElementById('flux-legend').classList.toggle('visible', inFluxMode()); render();
+  });
+  document.querySelectorAll('.tab').forEach(btn => btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    activeView = btn.dataset.view;
+    syncControls();
+    render();
+  }));
+  window.addEventListener('resize', render);
+
+  syncControls();
+  render();
+}
+
+function syncControls() {
+  const isEscher = activeView === 'escher';
+  document.getElementById('ctrl-subsystem').style.display   = isEscher ? 'none' : '';
+  document.getElementById('ctrl-topN').style.display        = isEscher ? 'none' : '';
+  document.getElementById('ctrl-compartment').style.display = isEscher ? 'none' : '';
+  document.getElementById('ctrl-escher-map').style.display  = isEscher ? ''     : 'none';
+  document.getElementById('legend').style.display           = isEscher ? 'none' : '';
+}
+
+function buildConditionDropdown() {
+  const sel = document.getElementById('sel-condition');
+  sel.innerHTML = '';
+  const none = document.createElement('option');
+  none.value = '__none__'; none.textContent = '— compartment colours —';
+  sel.appendChild(none);
+  const groups = {};
+  for (const c of keio.conditions) (groups[c.group] = groups[c.group] ?? []).push(c);
+  const order = ['carbon source','nitrogen source','sulfur source','stress'];
+  const sorted = [...order.filter(g => groups[g]), ...Object.keys(groups).filter(g => !order.includes(g))];
+  for (const g of sorted) {
+    const og = document.createElement('optgroup');
+    og.label = g.charAt(0).toUpperCase() + g.slice(1);
+    for (const c of groups[g]) {
+      const o = document.createElement('option');
+      o.value = c.key;
+      o.textContent = c.key === keio.baseline ? `${c.label} ★` : c.label;
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+}
+
+// ── Render dispatcher ─────────────────────────────────────────────────────────
+function render() {
+  document.getElementById('chart').innerHTML = '';
+  if (activeView === 'chord') renderChord();
+  else renderEscher();
+}
+
+// ── Chord Diagram ─────────────────────────────────────────────────────────────
+function renderChord() {
+  const subsystem  = document.getElementById('sel-subsystem').value;
+  const topN       = +document.getElementById('rng-topN').value;
+  const compFilter = document.getElementById('sel-compartment').value;
+  const fluxMode   = inFluxMode();
+  const chart      = document.getElementById('chart');
+
+  const reactions = gem.reactions.filter(r => r.subsystem === subsystem);
+  const metLookup = Object.fromEntries(
+    gem.metabolites.filter(m => !compFilter || m.compartment === compFilter).map(m => [m.id, m])
+  );
+  const connectivity = {};
+  for (const rxn of reactions)
+    for (const id of Object.keys(rxn.metabolites))
+      if (id in metLookup) connectivity[id] = (connectivity[id] ?? 0) + 1;
+
+  const topMets = Object.keys(connectivity).sort((a,b)=>connectivity[b]-connectivity[a]).slice(0,topN);
+  if (topMets.length < 2) { chart.innerHTML = '<div id="status">No data for this selection.</div>'; return; }
+
+  const idx = Object.fromEntries(topMets.map((id,i) => [id,i]));
+  const N   = topMets.length;
+  const matrix   = Array.from({length:N}, () => new Array(N).fill(0));
+  const rxnNames = {}, rxnIds = {};
+
+  for (const rxn of reactions) {
+    const entries = Object.entries(rxn.metabolites);
+    const subs  = entries.filter(([id,s]) => s<0 && id in idx).map(([id])=>id);
+    const prods = entries.filter(([id,s]) => s>0 && id in idx).map(([id])=>id);
+    for (const s of subs) for (const p of prods) {
+      if (s===p) continue;
+      matrix[idx[s]][idx[p]] += 1;
+      const key = `${idx[s]}-${idx[p]}`;
+      (rxnNames[key] = rxnNames[key]??[]).push(rxn.name||rxn.id);
+      (rxnIds[key]   = rxnIds[key]  ??[]).push(rxn.id);
+    }
+  }
+
+  const size   = Math.min(chart.clientWidth, chart.clientHeight, 760) - 20;
+  const outerR = size/2 - 40, innerR = outerR - 18;
+  const svg    = d3.create('svg').attr('width', size).attr('height', size);
+  const g      = svg.append('g').attr('transform', `translate(${size/2},${size/2})`);
+  const chords = d3.chord().padAngle(0.03).sortSubgroups(d3.descending)(matrix);
+  const arc    = d3.arc().innerRadius(innerR).outerRadius(outerR);
+  const ribbon = d3.ribbon().radius(innerR - 1);
+  const mets   = topMets.map(id => metLookup[id]);
+  const compColor = d => COMP_COLORS[mets[d.index]?.compartment] ?? FALLBACK;
+  const tooltip = document.getElementById('tooltip');
+
+  const deltaMap = {};
+  if (fluxMode) for (const ch of chords) {
+    const key = `${ch.source.index}-${ch.target.index}`;
+    deltaMap[key] = ribbonDelta([...(rxnIds[key]??[]), ...(rxnIds[`${ch.target.index}-${ch.source.index}`]??[])]);
+  }
+
+  const group = g.append('g').attr('class','group').selectAll('g').data(chords.groups).join('g');
+  group.append('path')
+    .attr('fill', compColor).attr('stroke', d=>d3.rgb(compColor(d)).darker(0.5)).attr('d', arc)
+    .on('mouseover', (event,d) => {
+      const m = mets[d.index];
+      tooltip.style.display='block';
+      tooltip.innerHTML = `<strong>${m.name||m.id}</strong><br>BiGG: ${m.id}<br>
+        Compartment: ${COMP_NAMES[m.compartment]??m.compartment}
+        ${m.formula?`<br>Formula: ${m.formula}`:''}<br>Charge: ${m.charge}`;
+      g.selectAll('.ribbons path').style('opacity', rd =>
+        rd.source.index===d.index||rd.target.index===d.index ? 1 : 0.06);
+    })
+    .on('mousemove', e => { tooltip.style.left=(e.clientX+14)+'px'; tooltip.style.top=(e.clientY-12)+'px'; })
+    .on('mouseout', () => { tooltip.style.display='none'; g.selectAll('.ribbons path').style('opacity', fluxMode?0.85:0.72); });
+
+  const lsz = N>50?'7px':N>35?'8.5px':N>20?'10px':'11.5px';
+  group.append('text').each(d=>{d.angle=(d.startAngle+d.endAngle)/2;})
+    .attr('dy','0.35em')
+    .attr('transform', d=>`rotate(${d.angle*180/Math.PI-90}) translate(${outerR+7}) ${d.angle>Math.PI?'rotate(180)':''}`)
+    .attr('text-anchor', d=>d.angle>Math.PI?'end':'start')
+    .attr('fill','#94a3b8').attr('font-size',lsz)
+    .text(d=>{ const nm=mets[d.index]?.name||mets[d.index]?.id||''; const ml=N>35?18:24; return nm.length>ml?nm.slice(0,ml-1)+'…':nm; });
+
+  g.append('g').attr('class','ribbons').selectAll('path').data(chords).join('path')
+    .attr('d', ribbon)
+    .attr('fill', d => {
+      if (!fluxMode) return compColor(chords.groups[d.source.index]);
+      return fluxColor(deltaMap[`${d.source.index}-${d.target.index}`]);
+    })
+    .attr('stroke', d => {
+      const c = fluxMode ? fluxColor(deltaMap[`${d.source.index}-${d.target.index}`]) : compColor(chords.groups[d.source.index]);
+      return d3.rgb(c).darker(0.5);
+    })
+    .style('opacity', fluxMode?0.85:0.72)
+    .on('mouseover', (event,d) => {
+      const key = `${d.source.index}-${d.target.index}`;
+      const rxns = rxnNames[key] ?? rxnNames[`${d.target.index}-${d.source.index}`] ?? [];
+      const delta = deltaMap[key];
+      tooltip.style.display='block';
+      tooltip.innerHTML = `
+        <strong>${mets[d.source.index]?.name}</strong> → <strong>${mets[d.target.index]?.name}</strong><br>
+        ${rxns.length} reaction${rxns.length!==1?'s':''}
+        <div class="sub">${rxns.slice(0,5).join(', ')}${rxns.length>5?` +${rxns.length-5} more`:''}</div>
+        ${inFluxMode() ? fluxLabel(delta) : ''}`;
+      d3.select(event.currentTarget).style('opacity',1);
+    })
+    .on('mousemove', e=>{tooltip.style.left=(e.clientX+14)+'px';tooltip.style.top=(e.clientY-12)+'px';})
+    .on('mouseout', (event)=>{tooltip.style.display='none';d3.select(event.currentTarget).style('opacity',fluxMode?0.85:0.72);});
+
+  chart.appendChild(svg.node());
+}
+
+// ── Cytoscape Flux Map ────────────────────────────────────────────────────────
+
+const ESCHER_MAP_PATHS = {
+  'central_metabolism':          './data/escher_maps/central_metabolism.json',
+  'fatty_acid_beta_oxidation':   './data/escher_maps/fatty_acid_beta_oxidation.json',
+  'fatty_acid_biosynthesis':     './data/escher_maps/fatty_acid_biosynthesis.json',
+  'nucleotide_metabolism':       './data/escher_maps/nucleotide_metabolism.json',
+  'nucleotide_histidine_biosyn': './data/escher_maps/nucleotide_histidine_biosyn.json',
+};
+
+// Build a metabolite lookup once
+let _metLookup = null;
+function metLookup() {
+  if (!_metLookup) _metLookup = Object.fromEntries(gem.metabolites.map(m => [m.id, m]));
+  return _metLookup;
+}
+let _rxnLookup = null;
+function rxnLookup() {
+  if (!_rxnLookup) _rxnLookup = Object.fromEntries(gem.reactions.map(r => [r.id, r]));
+  return _rxnLookup;
+}
+
+const CY_STYLE = [
+  // Primary metabolite nodes
+  { selector: 'node[type="met"][primary=1]', style: {
+    'shape': 'ellipse',
+    'width': 22, 'height': 22,
+    'background-color': 'data(fill)',
+    'border-width': 2, 'border-color': 'data(border)',
+    'label': 'data(label)',
+    'font-size': 13, 'font-weight': 500,
+    'color': '#e2e8f0',
+    'text-valign': 'bottom', 'text-halign': 'center',
+    'text-margin-y': 5,
+    'text-background-color': '#0a0e18',
+    'text-background-opacity': 0.85,
+    'text-background-padding': '3px',
+    'text-background-shape': 'roundrectangle',
+    'min-zoomed-font-size': 5,
+    'z-index': 10,
+  }},
+  // Secondary metabolite nodes (no label, smaller)
+  { selector: 'node[type="met"][primary=0]', style: {
+    'shape': 'ellipse',
+    'width': 10, 'height': 10,
+    'background-color': 'data(fill)',
+    'border-width': 1.5, 'border-color': 'data(border)',
+    'label': '',
+    'z-index': 8,
+  }},
+  // Reaction nodes
+  { selector: 'node[type="rxn"]', style: {
+    'shape': 'rectangle',
+    'width': 12, 'height': 7,
+    'background-color': 'data(fill)',
+    'border-width': 0,
+    'label': 'data(label)',
+    'font-size': 9,
+    'color': '#64748b',
+    'text-valign': 'bottom', 'text-halign': 'center',
+    'text-margin-y': 3,
+    'min-zoomed-font-size': 4,
+    'z-index': 5,
+  }},
+  // Edges
+  { selector: 'edge', style: {
+    'width': 'data(width)',
+    'line-color': 'data(color)',
+    'target-arrow-color': 'data(color)',
+    'target-arrow-shape': 'triangle',
+    'arrow-scale': 0.75,
+    'curve-style': 'bezier',
+    'opacity': 0.8,
+  }},
+  // Hover highlights
+  { selector: 'node:active', style: { 'overlay-opacity': 0 }},
+  { selector: '.highlighted', style: { 'opacity': 1, 'z-index': 999 }},
+  { selector: '.faded', style: { 'opacity': 0.15 }},
+];
+
+async function renderEscher() {
+  const chart  = document.getElementById('chart');
+  const mapKey = document.getElementById('sel-escher-map').value;
+
+  if (!escherMapCache[mapKey]) {
+    chart.innerHTML = '<div id="status">Loading map…</div>';
+    try {
+      const raw = await fetch(ESCHER_MAP_PATHS[mapKey]).then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      });
+      escherMapCache[mapKey] = Array.isArray(raw) ? raw[1] : raw;
+    } catch (e) {
+      chart.innerHTML = `<div id="status">Failed to load map: ${e.message}</div>`;
+      return;
+    }
+  }
+
+  const { nodes, reactions } = escherMapCache[mapKey];
+  const SCALE = 10; // shrink Escher coords to sensible Cytoscape units
+
+  // Pre-compute reaction deltas
+  const condition = activeCondition();
+  const fluxMode  = inFluxMode();
+  const deltaMap  = {};
+  if (fluxMode) {
+    for (const [id, scores] of Object.entries(keio.reaction_scores)) {
+      const sc = scores[condition], sb = scores[keio.baseline];
+      if (sc != null && sb != null) deltaMap[id] = sc - sb;
+    }
+  }
+
+  function edgeColor(biggId) {
+    return fluxMode ? fluxColor(deltaMap[biggId]) : '#334155';
+  }
+  function edgeWidth(biggId) {
+    if (!fluxMode) return 2.5;
+    const d = deltaMap[biggId];
+    if (d == null) return 1.5;
+    return Math.max(1.5, Math.min(8, 1.5 + Math.abs(d) * 2.2));
+  }
+  function rxnFill(biggId) {
+    return fluxMode ? fluxColor(deltaMap[biggId]) : '#475569';
+  }
+
+  // ── Build elements ──────────────────────────────────────────────────────────
+  const elements = [];
+
+  // Metabolite nodes
+  for (const [nid, node] of Object.entries(nodes)) {
+    if (node.node_type !== 'metabolite') continue;
+    const met   = metLookup()[node.bigg_id];
+    const comp  = met?.compartment ?? '';
+    const fill  = COMP_COLORS[comp] ?? '#334155';
+    const dark  = d3.rgb(fill).darker(0.8).formatHex();
+    elements.push({
+      group: 'nodes',
+      data: {
+        id: `m_${nid}`,
+        type: 'met',
+        primary: node.node_is_primary ? 1 : 0,
+        label: node.node_is_primary ? (node.name || node.bigg_id) : '',
+        bigg_id: node.bigg_id,
+        name: node.name || node.bigg_id,
+        comp, fill, border: dark,
+        formula: met?.formula ?? '',
+      },
+      position: { x: node.x / SCALE, y: node.y / SCALE },
+    });
+  }
+
+  // Reaction nodes + edges
+  for (const [rid, rxn] of Object.entries(reactions)) {
+    const biggId = rxn.bigg_id;
+
+    elements.push({
+      group: 'nodes',
+      data: {
+        id: `r_${rid}`,
+        type: 'rxn',
+        label: biggId,
+        bigg_id: biggId,
+        name: rxn.name || biggId,
+        fill: rxnFill(biggId),
+        delta: deltaMap[biggId] ?? null,
+      },
+      position: { x: rxn.label_x / SCALE, y: rxn.label_y / SCALE },
+    });
+
+    // Find connected metabolite nodes via segments
+    const connMets = new Map(); // nodeId → bigg_id
+    for (const seg of Object.values(rxn.segments)) {
+      for (const nid of [seg.from_node_id, seg.to_node_id]) {
+        if (nodes[nid]?.node_type === 'metabolite') connMets.set(nid, nodes[nid].bigg_id);
+      }
+    }
+
+    const color = edgeColor(biggId);
+    const width = edgeWidth(biggId);
+
+    for (const [metNid, metBiggId] of connMets) {
+      const coeff = rxn.metabolites.find(m => m.bigg_id === metBiggId)?.coefficient ?? 0;
+      if (coeff === 0) continue;
+      elements.push({
+        group: 'edges',
+        data: {
+          id: `e_${rid}_${metNid}`,
+          source: coeff < 0 ? `m_${metNid}` : `r_${rid}`,
+          target: coeff < 0 ? `r_${rid}`    : `m_${metNid}`,
+          bigg_id: biggId,
+          color, width,
+        },
+      });
+    }
+  }
+
+  // ── Mount Cytoscape ─────────────────────────────────────────────────────────
+  chart.innerHTML = '<div id="cy"></div>';
+
+  const cy = cytoscape({
+    container: document.getElementById('cy'),
+    elements,
+    style: CY_STYLE,
+    layout: { name: 'preset' },
+    minZoom: 0.03, maxZoom: 8,
+    boxSelectionEnabled: false,
+    autoungrabify: false,
+  });
+
+  cy.fit(undefined, 40);
+
+  // ── Tooltips ────────────────────────────────────────────────────────────────
+  const tooltip = document.getElementById('tooltip');
+
+  cy.on('mouseover', 'node[type="met"]', e => {
+    const d = e.target.data();
+    tooltip.style.display = 'block';
+    tooltip.innerHTML = `
+      <strong>${d.name}</strong><br>BiGG: ${d.bigg_id}<br>
+      Compartment: ${COMP_NAMES[d.comp] ?? d.comp}
+      ${d.formula ? `<br>Formula: ${d.formula}` : ''}`;
+  });
+
+  cy.on('mouseover', 'node[type="rxn"]', e => {
+    const d   = e.target.data();
+    const rxnObj = rxnLookup()[d.bigg_id];
+    tooltip.style.display = 'block';
+    tooltip.innerHTML = `
+      <strong>${d.name}</strong><br>ID: ${d.bigg_id}
+      ${rxnObj?.gene_reaction_rule ? `<div class="sub">Genes: ${rxnObj.gene_reaction_rule}</div>` : ''}
+      ${fluxMode ? fluxLabel(d.delta) : ''}`;
+  });
+
+  cy.on('mousemove', e => {
+    tooltip.style.left = (e.originalEvent.clientX + 14) + 'px';
+    tooltip.style.top  = (e.originalEvent.clientY - 12) + 'px';
+  });
+  cy.on('mouseout', 'node', () => { tooltip.style.display = 'none'; });
+
+  // Highlight neighbours on click
+  cy.on('tap', 'node', e => {
+    cy.elements().removeClass('highlighted faded');
+    const node = e.target;
+    const hood = node.closedNeighborhood();
+    hood.addClass('highlighted');
+    cy.elements().not(hood).addClass('faded');
+  });
+  cy.on('tap', e => {
+    if (e.target === cy) cy.elements().removeClass('highlighted faded');
+  });
+}
+
+init();
+</script>
+</body>
+</html>

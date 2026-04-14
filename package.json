@@ -1,0 +1,28 @@
+{
+    "name": "geo-gem",
+    "version": "1.0.0",
+    "description": "E. coli iML1515 GEM → Geo Knowledge Graph pipeline",
+    "type": "module",
+    "scripts": {
+        "parse": "python3 parse_model.py",
+        "generate": "npx tsx src/generate_ops.ts",
+        "publish": "npx tsx src/publish_gem.ts",
+        "validate": "npx tsx src/validate.ts",
+        "visualise": "python3 -m http.server 8080 --directory .",
+        "lint": "biome check --write ."
+    },
+    "dependencies": {
+        "@geoprotocol/geo-sdk": "^0.17.0",
+        "cytoscape": "^3.33.2",
+        "dotenv": "^16.4.7",
+        "uuid": "^9.0.0",
+        "viem": "^2.23.2"
+    },
+    "devDependencies": {
+        "@biomejs/biome": "^1.9.4",
+        "@types/node": "^25.6.0",
+        "@types/uuid": "^9.0.0",
+        "tsx": "^4.19.0",
+        "typescript": "^5.0.0"
+    }
+}
