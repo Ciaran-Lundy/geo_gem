@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <title>iML1515 — Metabolic Network</title>
   <script src="https://d3js.org/d3.v7.min.js"></script>
-  <script src="./node_modules/cytoscape/dist/cytoscape.min.js"></script>
+  <script src="https://unpkg.com/escher@1.7.3/dist/escher.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: #0f1117; color: #e2e8f0; font-family: system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }
@@ -56,8 +56,8 @@
     .ribbons path { transition: opacity 0.15s; }
     .ribbons path:hover { opacity: 1 !important; }
 
-    /* Cytoscape container */
-    #cy { width: 100%; height: 100%; position: absolute; inset: 0; background: #0f1117; }
+    /* Escher container — white background matches the official Escher viewer */
+    #escher-container { width: 100%; height: 100%; position: absolute; inset: 0; background: #fff; overflow: hidden; }
 
     #tooltip {
       position: fixed; pointer-events: none;
@@ -90,6 +90,7 @@
   <div class="tab-bar">
     <button class="tab active" data-view="chord">Chord Diagram</button>
     <button class="tab"        data-view="escher">Escher Flux Map</button>
+    <button class="tab"        data-view="alluvial">Omics Flow</button>
   </div>
 </header>
 
@@ -114,6 +115,14 @@
   <div class="ctrl" id="ctrl-escher-map" style="display:none">
     <label>Pathway map (iJO1366)</label>
     <select id="sel-escher-map"></select>
+  </div>
+  <div class="ctrl" id="ctrl-escher-layer" style="display:none">
+    <label>Omics layer</label>
+    <select id="sel-escher-layer">
+      <option value="fluxome">Fluxome — reaction fluxes</option>
+      <option value="gene">Gene Activity — GPR-weighted</option>
+      <option value="metabolome">Metabolome — metabolite nodes</option>
+    </select>
   </div>
   <!-- Shared controls -->
   <div class="ctrl" id="ctrl-condition" style="display:none">
@@ -143,6 +152,142 @@ const COMP_NAMES  = { c:'Cytoplasm', e:'Extracellular', p:'Periplasm', m:'Mitoch
 const COMP_COLORS = { c:'#3b82f6', e:'#f59e0b', p:'#10b981', m:'#8b5cf6', x:'#ef4444', n:'#ec4899' };
 const FALLBACK    = '#64748b';
 
+// ── Geo knowledge-graph ───────────────────────────────────────────────────────
+const GEO_API   = 'https://testnet-api.geobrowser.io/graphql';
+const GEO_SPACE = 'aec359295ff90d00aea6696f0ddb1bbc';
+
+// Ontology IDs — UUIDv5(name, namespace=6ba7b810-9dad-11d1-80b4-00c04fd430c8), dashes removed
+const GEO_TYPES = {
+  METABOLITE : '8e7980fb4f3c5632ab22c5818534b167',
+  REACTION   : '2eceff2579105d129e747cc86401105c',
+};
+const GEO_PROPS = {
+  BIGG_ID           : '23c0bfeeed0e5035b4129152bbb3dc6a',
+  FORMULA           : 'b8e367155aca576089fa06c408bef7de',
+  CHARGE            : '68a87cf7359f5032b246a2792ed12e33',
+  COMPARTMENT_CODE  : 'e3e4d05ee4a1535ba2973869fa2cb732',
+  LOWER_BOUND       : 'b3adc5f5edc651a5a815f9edc8b546e8',
+  UPPER_BOUND       : '2f61be01ee135b66a9bcb50770f93631',
+  GENE_REACTION_RULE: '812b254fdc64562ca691c4b95219c21b',
+  STOICHIOMETRY     : '1de24f5fdf9e5b389c6c9749d1220072',
+  SUBSYSTEM_NAME    : 'e93af5ca42ff570d8b5efa841c34cb5c',
+};
+const GEO_RELS = {
+  SUBSTRATE_OF : '0362404c4abd5404b920cec46da874b9',
+  PRODUCT_OF   : '9207b44c580f5201bc50fcaf5fa84aa7',
+  PART_OF      : '3d369d3fee3a5b77b768dc62d5fa191a',
+};
+
+async function geoGql(query) {
+  const r = await fetch(GEO_API, {
+    method : 'POST',
+    headers: { 'content-type': 'application/json' },
+    body   : JSON.stringify({ query }),
+  });
+  if (!r.ok) throw new Error(`Geo API HTTP ${r.status}`);
+  const { data, errors } = await r.json();
+  if (errors?.length) throw new Error(errors.map(e => e.message).join('; '));
+  return data;
+}
+
+// Fetch all pages of a given entity type in parallel (count + first page together).
+async function fetchGeoPages(typeId, fields, batchSize = 500) {
+  const [countRes, firstRes] = await Promise.all([
+    geoGql(`{ entitiesConnection(spaceId:"${GEO_SPACE}", typeId:"${typeId}") { totalCount } }`),
+    geoGql(`{ entities(spaceId:"${GEO_SPACE}", typeId:"${typeId}", first:${batchSize}, offset:0) { ${fields} } }`),
+  ]);
+  const total = countRes.entitiesConnection.totalCount;
+  const pages = Math.ceil(total / batchSize);
+  if (pages <= 1) return { total, entities: firstRes.entities };
+  const rest = await Promise.all(
+    Array.from({ length: pages - 1 }, (_, i) =>
+      geoGql(`{ entities(spaceId:"${GEO_SPACE}", typeId:"${typeId}", first:${batchSize}, offset:${(i + 1) * batchSize}) { ${fields} } }`)
+    )
+  );
+  return { total, entities: [...firstRes.entities, ...rest.flatMap(r => r.entities)] };
+}
+
+function setStatus(msg) {
+  const el = document.getElementById('status');
+  if (el) el.textContent = msg;
+}
+
+async function loadGemFromGeo() {
+  const CACHE_KEY = `geo_gem_v1_${GEO_SPACE}`;
+  try {
+    const cached = sessionStorage.getItem(CACHE_KEY);
+    if (cached) return JSON.parse(cached);
+  } catch (_) {}
+
+  // ── 1. Metabolites (need compartment via PART_OF → Compartment entity) ────
+  setStatus('Fetching metabolites from Geo…');
+  const metFields = `id name
+    valuesList { propertyId text float }
+    relationsList(first:3) {
+      typeId toEntity { valuesList { propertyId text } }
+    }`;
+  const { total: nMets, entities: rawMets } =
+    await fetchGeoPages(GEO_TYPES.METABOLITE, metFields);
+  setStatus(`${rawMets.length}/${nMets} metabolites — fetching reactions…`);
+
+  // entityId → BiGG ID map — needed to reconstruct stoichiometry on reactions
+  const entityToMetBigg = {};
+  const metabolites = rawMets.map(e => {
+    const vals   = Object.fromEntries(e.valuesList.map(v => [v.propertyId, v.text ?? v.float]));
+    const partOf = e.relationsList.find(r => r.typeId === GEO_RELS.PART_OF);
+    const cVals  = Object.fromEntries(
+      (partOf?.toEntity?.valuesList ?? []).map(v => [v.propertyId, v.text ?? v.float])
+    );
+    const biggId = vals[GEO_PROPS.BIGG_ID] ?? e.name;
+    entityToMetBigg[e.id] = biggId;
+    return {
+      id         : biggId,
+      name       : e.name,
+      compartment: cVals[GEO_PROPS.COMPARTMENT_CODE] ?? 'c',
+      formula    : vals[GEO_PROPS.FORMULA] ?? '',
+      charge     : vals[GEO_PROPS.CHARGE] ?? 0,
+    };
+  });
+
+  // ── 2. Reactions (stoichiometry lives on the relation entity's values) ────
+  // backlinksList gives SUBSTRATE_OF / PRODUCT_OF relations from metabolites;
+  // each relation entity carries the STOICHIOMETRY float property.
+  const rxnFields = `id name
+    valuesList { propertyId text float }
+    backlinksList(first:200) {
+      typeId fromEntityId
+      entity { valuesList { propertyId float } }
+    }`;
+  const { total: nRxns, entities: rawRxns } =
+    await fetchGeoPages(GEO_TYPES.REACTION, rxnFields);
+  setStatus(`${rawRxns.length}/${nRxns} reactions — assembling model…`);
+
+  const reactions = rawRxns.map(e => {
+    const vals = Object.fromEntries(e.valuesList.map(v => [v.propertyId, v.text ?? v.float]));
+    const mets = {};
+    for (const bl of e.backlinksList) {
+      if (bl.typeId !== GEO_RELS.SUBSTRATE_OF && bl.typeId !== GEO_RELS.PRODUCT_OF) continue;
+      const bigg = entityToMetBigg[bl.fromEntityId];
+      if (!bigg) continue;
+      const s = bl.entity?.valuesList?.find(v => v.propertyId === GEO_PROPS.STOICHIOMETRY)?.float ?? 1;
+      mets[bigg] = bl.typeId === GEO_RELS.SUBSTRATE_OF ? -s : s;
+    }
+    return {
+      id                : vals[GEO_PROPS.BIGG_ID] ?? e.name,
+      name              : e.name,
+      subsystem         : vals[GEO_PROPS.SUBSYSTEM_NAME] ?? '',
+      lower_bound       : vals[GEO_PROPS.LOWER_BOUND] ?? 0,
+      upper_bound       : vals[GEO_PROPS.UPPER_BOUND] ?? 1000,
+      gene_reaction_rule: vals[GEO_PROPS.GENE_REACTION_RULE] ?? '',
+      metabolites       : mets,
+    };
+  });
+
+  const gem = { metabolites, reactions, genes: [] };
+  try { sessionStorage.setItem(CACHE_KEY, JSON.stringify(gem)); } catch (_) {}
+  return gem;
+}
+
 const ESCHER_MAPS = [
   { key: 'central_metabolism',          label: 'Central Metabolism'              },
   { key: 'fatty_acid_beta_oxidation',   label: 'Fatty Acid β-Oxidation'          },
@@ -152,9 +297,10 @@ const ESCHER_MAPS = [
 ];
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let gem         = null;
-let keio        = null;
-let activeView  = 'chord';
+let gem          = null;
+let keio         = null;
+let activeView   = 'chord';
+let escherBuilder = null;
 const escherMapCache = {};
 
 // ── Flux helpers ──────────────────────────────────────────────────────────────
@@ -198,14 +344,26 @@ function fluxLabel(delta) {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 async function init() {
   try {
-    gem = await fetch('./data/iml1515.json').then(r => {
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return r.json();
-    });
+    gem = await loadGemFromGeo();
   } catch (e) {
     document.getElementById('status').textContent =
-      `Could not load model: ${e.message}. Serve via HTTP (npm run visualise).`;
+      `Could not load model from Geo: ${e.message}`;
     return;
+  }
+
+  // ── Pre-compute index structures for derived omics layers ──
+  // gene → [rxn ids] and rxn → [gene ids], both via GPR strings
+  gem._geneToRxns = {};
+  gem._rxnToGenes = {};
+  gem._metToRxns  = {};
+  const geneRe = /b\d+/g;
+  for (const rxn of gem.reactions) {
+    const genes = [...(rxn.gene_reaction_rule || '').matchAll(geneRe)].map(m => m[0]);
+    gem._rxnToGenes[rxn.id] = genes;
+    for (const g of genes)
+      (gem._geneToRxns[g] = gem._geneToRxns[g] ?? []).push(rxn.id);
+    for (const metId of Object.keys(rxn.metabolites ?? {}))
+      (gem._metToRxns[metId] = gem._metToRxns[metId] ?? []).push(rxn.id);
   }
 
   // Keio (optional)
@@ -258,14 +416,19 @@ async function init() {
   selSys.addEventListener('change', render);
   selComp.addEventListener('change', render);
   selEscher.addEventListener('change', render);
+  document.getElementById('sel-escher-layer').addEventListener('change', () => {
+    if (activeView === 'escher' && escherBuilder) updateEscherData(); else render();
+  });
   document.getElementById('rng-topN').addEventListener('input', e => {
     document.getElementById('val-topN').textContent = e.target.value; render();
   });
   document.getElementById('rng-threshold').addEventListener('input', e => {
-    document.getElementById('val-threshold').textContent = (+e.target.value/10).toFixed(1); render();
+    document.getElementById('val-threshold').textContent = (+e.target.value/10).toFixed(1);
+    if (activeView === 'escher' && escherBuilder) updateEscherData(); else render();
   });
   document.getElementById('sel-condition')?.addEventListener('change', () => {
-    document.getElementById('flux-legend').classList.toggle('visible', inFluxMode()); render();
+    document.getElementById('flux-legend').classList.toggle('visible', inFluxMode());
+    if (activeView === 'escher' && escherBuilder) updateEscherData(); else render();
   });
   document.querySelectorAll('.tab').forEach(btn => btn.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
@@ -281,12 +444,15 @@ async function init() {
 }
 
 function syncControls() {
-  const isEscher = activeView === 'escher';
-  document.getElementById('ctrl-subsystem').style.display   = isEscher ? 'none' : '';
-  document.getElementById('ctrl-topN').style.display        = isEscher ? 'none' : '';
-  document.getElementById('ctrl-compartment').style.display = isEscher ? 'none' : '';
-  document.getElementById('ctrl-escher-map').style.display  = isEscher ? ''     : 'none';
-  document.getElementById('legend').style.display           = isEscher ? 'none' : '';
+  const isChord    = activeView === 'chord';
+  const isEscher   = activeView === 'escher';
+  const isAlluvial = activeView === 'alluvial';
+  document.getElementById('ctrl-subsystem').style.display    = isChord    ? ''     : 'none';
+  document.getElementById('ctrl-topN').style.display         = isChord    ? ''     : 'none';
+  document.getElementById('ctrl-compartment').style.display  = isChord    ? ''     : 'none';
+  document.getElementById('ctrl-escher-map').style.display   = isEscher   ? ''     : 'none';
+  document.getElementById('ctrl-escher-layer').style.display = isEscher   ? ''     : 'none';
+  document.getElementById('legend').style.display            = isChord    ? ''     : 'none';
 }
 
 function buildConditionDropdown() {
@@ -315,8 +481,10 @@ function buildConditionDropdown() {
 // ── Render dispatcher ─────────────────────────────────────────────────────────
 function render() {
   document.getElementById('chart').innerHTML = '';
-  if (activeView === 'chord') renderChord();
-  else renderEscher();
+  escherBuilder = null;
+  if      (activeView === 'chord')    renderChord();
+  else if (activeView === 'escher')   renderEscher();
+  else if (activeView === 'alluvial') renderAlluvial();
 }
 
 // ── Chord Diagram ─────────────────────────────────────────────────────────────
@@ -426,7 +594,7 @@ function renderChord() {
   chart.appendChild(svg.node());
 }
 
-// ── Cytoscape Flux Map ────────────────────────────────────────────────────────
+// ── Escher Flux Map — rendered via the official Escher library ─────────────────
 
 const ESCHER_MAP_PATHS = {
   'central_metabolism':          './data/escher_maps/central_metabolism.json',
@@ -435,76 +603,6 @@ const ESCHER_MAP_PATHS = {
   'nucleotide_metabolism':       './data/escher_maps/nucleotide_metabolism.json',
   'nucleotide_histidine_biosyn': './data/escher_maps/nucleotide_histidine_biosyn.json',
 };
-
-// Build a metabolite lookup once
-let _metLookup = null;
-function metLookup() {
-  if (!_metLookup) _metLookup = Object.fromEntries(gem.metabolites.map(m => [m.id, m]));
-  return _metLookup;
-}
-let _rxnLookup = null;
-function rxnLookup() {
-  if (!_rxnLookup) _rxnLookup = Object.fromEntries(gem.reactions.map(r => [r.id, r]));
-  return _rxnLookup;
-}
-
-const CY_STYLE = [
-  // Primary metabolite nodes
-  { selector: 'node[type="met"][primary=1]', style: {
-    'shape': 'ellipse',
-    'width': 22, 'height': 22,
-    'background-color': 'data(fill)',
-    'border-width': 2, 'border-color': 'data(border)',
-    'label': 'data(label)',
-    'font-size': 13, 'font-weight': 500,
-    'color': '#e2e8f0',
-    'text-valign': 'bottom', 'text-halign': 'center',
-    'text-margin-y': 5,
-    'text-background-color': '#0a0e18',
-    'text-background-opacity': 0.85,
-    'text-background-padding': '3px',
-    'text-background-shape': 'roundrectangle',
-    'min-zoomed-font-size': 5,
-    'z-index': 10,
-  }},
-  // Secondary metabolite nodes (no label, smaller)
-  { selector: 'node[type="met"][primary=0]', style: {
-    'shape': 'ellipse',
-    'width': 10, 'height': 10,
-    'background-color': 'data(fill)',
-    'border-width': 1.5, 'border-color': 'data(border)',
-    'label': '',
-    'z-index': 8,
-  }},
-  // Reaction nodes
-  { selector: 'node[type="rxn"]', style: {
-    'shape': 'rectangle',
-    'width': 12, 'height': 7,
-    'background-color': 'data(fill)',
-    'border-width': 0,
-    'label': 'data(label)',
-    'font-size': 9,
-    'color': '#64748b',
-    'text-valign': 'bottom', 'text-halign': 'center',
-    'text-margin-y': 3,
-    'min-zoomed-font-size': 4,
-    'z-index': 5,
-  }},
-  // Edges
-  { selector: 'edge', style: {
-    'width': 'data(width)',
-    'line-color': 'data(color)',
-    'target-arrow-color': 'data(color)',
-    'target-arrow-shape': 'triangle',
-    'arrow-scale': 0.75,
-    'curve-style': 'bezier',
-    'opacity': 0.8,
-  }},
-  // Hover highlights
-  { selector: 'node:active', style: { 'overlay-opacity': 0 }},
-  { selector: '.highlighted', style: { 'opacity': 1, 'z-index': 999 }},
-  { selector: '.faded', style: { 'opacity': 0.15 }},
-];
 
 async function renderEscher() {
   const chart  = document.getElementById('chart');
@@ -517,165 +615,317 @@ async function renderEscher() {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       });
-      escherMapCache[mapKey] = Array.isArray(raw) ? raw[1] : raw;
+      // Store the full [header, mapData] array — that's what escher.Builder expects
+      escherMapCache[mapKey] = raw;
     } catch (e) {
       chart.innerHTML = `<div id="status">Failed to load map: ${e.message}</div>`;
       return;
     }
   }
 
-  const { nodes, reactions } = escherMapCache[mapKey];
-  const SCALE = 10; // shrink Escher coords to sensible Cytoscape units
+  if (typeof escher === 'undefined') {
+    chart.innerHTML = '<div id="status">Escher library not loaded — check network connection.</div>';
+    return;
+  }
 
-  // Pre-compute reaction deltas
+  chart.innerHTML = '<div id="escher-container"></div>';
+
+  try {
+    escherBuilder = escher.Builder(
+      escherMapCache[mapKey],                       // full [header, data] array
+      null,                                         // no model overlay
+      null,                                         // use built-in CSS
+      escher.libs.d3_select('#escher-container'),   // must use Escher's own bundled d3
+      {
+        // viewer mode
+        menu: 'zoom',
+        scroll_behavior: 'zoom',
+        enable_editing: false,
+        full_screen_button: false,
+        fill_screen: true,                          // fill the container
+        // identifiers
+        identifiers_on_map: 'bigg_id',
+        // reaction appearance
+        reaction_no_data_color: '#bbbbbb',
+        reaction_no_data_size: 8,
+        // colour scale: negative delta = more active (red), positive = less active (blue)
+        reaction_scale: [
+          { type: 'min',   color: '#ef4444', size: 20 },
+          { type: 'value', value: 0, color: '#94a3b8', size: 8 },
+          { type: 'max',   color: '#3b82f6', size: 20 },
+        ],
+        reaction_styles: ['color', 'size', 'text'],
+        // metabolite appearance
+        metabolite_no_data_color: '#bbbbbb',
+        metabolite_no_data_size: 6,
+        metabolite_scale: [
+          { type: 'min',   color: '#ef4444', size: 14 },
+          { type: 'value', value: 0, color: '#94a3b8', size: 6 },
+          { type: 'max',   color: '#3b82f6', size: 14 },
+        ],
+        metabolite_styles: ['color', 'size'],
+      }
+    );
+    // Builder loads the map asynchronously; defer data application one tick
+    if (inFluxMode()) setTimeout(() => updateEscherData(), 0);
+  } catch (e) {
+    chart.innerHTML = `<div id="status">Escher render error: ${e.message}</div>`;
+    console.error(e);
+  }
+}
+
+function updateEscherData() {
+  if (!escherBuilder || !inFluxMode()) return;
+
   const condition = activeCondition();
-  const fluxMode  = inFluxMode();
-  const deltaMap  = {};
-  if (fluxMode) {
-    for (const [id, scores] of Object.entries(keio.reaction_scores)) {
-      const sc = scores[condition], sb = scores[keio.baseline];
-      if (sc != null && sb != null) deltaMap[id] = sc - sb;
+  const thresh    = fluxThreshold();
+  const layer     = document.getElementById('sel-escher-layer').value;
+
+  // Base: reaction delta scores for the selected condition vs glucose baseline
+  const rxnDeltas = {};
+  for (const [rxnId, scores] of Object.entries(keio.reaction_scores)) {
+    const sc = scores[condition], sb = scores[keio.baseline];
+    if (sc != null && sb != null) rxnDeltas[rxnId] = sc - sb;
+  }
+
+  if (layer === 'fluxome') {
+    // ── Fluxome: colour reaction lines directly by flux delta ──────────────────
+    const data = {};
+    for (const [id, d] of Object.entries(rxnDeltas))
+      if (Math.abs(d) >= thresh) data[id] = d;
+    escherBuilder.set_reaction_data(Object.keys(data).length ? data : null);
+    escherBuilder.set_metabolite_data(null);
+
+  } else if (layer === 'gene') {
+    // ── Gene Activity: aggregate flux deltas → genes (via GPR), then
+    //    back-project the gene-level signal onto the reaction lines ────────────
+    // Step 1 — gene score: mean reaction delta across everything the gene catalyses
+    const geneScores = {};
+    for (const [gene, rxns] of Object.entries(gem._geneToRxns)) {
+      const ds = rxns.map(r => rxnDeltas[r]).filter(d => d != null);
+      if (ds.length) geneScores[gene] = ds.reduce((a, b) => a + b) / ds.length;
     }
-  }
-
-  function edgeColor(biggId) {
-    return fluxMode ? fluxColor(deltaMap[biggId]) : '#334155';
-  }
-  function edgeWidth(biggId) {
-    if (!fluxMode) return 2.5;
-    const d = deltaMap[biggId];
-    if (d == null) return 1.5;
-    return Math.max(1.5, Math.min(8, 1.5 + Math.abs(d) * 2.2));
-  }
-  function rxnFill(biggId) {
-    return fluxMode ? fluxColor(deltaMap[biggId]) : '#475569';
-  }
-
-  // ── Build elements ──────────────────────────────────────────────────────────
-  const elements = [];
-
-  // Metabolite nodes
-  for (const [nid, node] of Object.entries(nodes)) {
-    if (node.node_type !== 'metabolite') continue;
-    const met   = metLookup()[node.bigg_id];
-    const comp  = met?.compartment ?? '';
-    const fill  = COMP_COLORS[comp] ?? '#334155';
-    const dark  = d3.rgb(fill).darker(0.8).formatHex();
-    elements.push({
-      group: 'nodes',
-      data: {
-        id: `m_${nid}`,
-        type: 'met',
-        primary: node.node_is_primary ? 1 : 0,
-        label: node.node_is_primary ? (node.name || node.bigg_id) : '',
-        bigg_id: node.bigg_id,
-        name: node.name || node.bigg_id,
-        comp, fill, border: dark,
-        formula: met?.formula ?? '',
-      },
-      position: { x: node.x / SCALE, y: node.y / SCALE },
-    });
-  }
-
-  // Reaction nodes + edges
-  for (const [rid, rxn] of Object.entries(reactions)) {
-    const biggId = rxn.bigg_id;
-
-    elements.push({
-      group: 'nodes',
-      data: {
-        id: `r_${rid}`,
-        type: 'rxn',
-        label: biggId,
-        bigg_id: biggId,
-        name: rxn.name || biggId,
-        fill: rxnFill(biggId),
-        delta: deltaMap[biggId] ?? null,
-      },
-      position: { x: rxn.label_x / SCALE, y: rxn.label_y / SCALE },
-    });
-
-    // Find connected metabolite nodes via segments
-    const connMets = new Map(); // nodeId → bigg_id
-    for (const seg of Object.values(rxn.segments)) {
-      for (const nid of [seg.from_node_id, seg.to_node_id]) {
-        if (nodes[nid]?.node_type === 'metabolite') connMets.set(nid, nodes[nid].bigg_id);
+    // Step 2 — back-project: each reaction is scored by mean of its gene scores
+    const data = {};
+    for (const [rxnId, genes] of Object.entries(gem._rxnToGenes)) {
+      const gs = genes.map(g => geneScores[g]).filter(s => s != null);
+      if (gs.length) {
+        const avg = gs.reduce((a, b) => a + b) / gs.length;
+        if (Math.abs(avg) >= thresh) data[rxnId] = avg;
       }
     }
+    escherBuilder.set_reaction_data(Object.keys(data).length ? data : null);
+    escherBuilder.set_metabolite_data(null);
 
-    const color = edgeColor(biggId);
-    const width = edgeWidth(biggId);
-
-    for (const [metNid, metBiggId] of connMets) {
-      const coeff = rxn.metabolites.find(m => m.bigg_id === metBiggId)?.coefficient ?? 0;
-      if (coeff === 0) continue;
-      elements.push({
-        group: 'edges',
-        data: {
-          id: `e_${rid}_${metNid}`,
-          source: coeff < 0 ? `m_${metNid}` : `r_${rid}`,
-          target: coeff < 0 ? `r_${rid}`    : `m_${metNid}`,
-          bigg_id: biggId,
-          color, width,
-        },
-      });
+  } else if (layer === 'metabolome') {
+    // ── Metabolome: colour metabolite circles by mean flux delta of
+    //    all reactions that produce/consume that metabolite ────────────────────
+    const data = {};
+    for (const [metId, rxns] of Object.entries(gem._metToRxns)) {
+      const ds = rxns.map(r => rxnDeltas[r]).filter(d => d != null);
+      if (ds.length) {
+        const avg = ds.reduce((a, b) => a + b) / ds.length;
+        if (Math.abs(avg) >= thresh) data[metId] = avg;
+      }
     }
+    escherBuilder.set_reaction_data(null);
+    escherBuilder.set_metabolite_data(Object.keys(data).length ? data : null);
+  }
+}
+
+// ── Omics Flow — Alluvial/Sankey across four biological layers ────────────────
+function renderAlluvial() {
+  const chart = document.getElementById('chart');
+
+  if (!inFluxMode()) {
+    chart.innerHTML = '<div id="status">Select a Keio condition above to see the omics flow.</div>';
+    return;
   }
 
-  // ── Mount Cytoscape ─────────────────────────────────────────────────────────
-  chart.innerHTML = '<div id="cy"></div>';
+  const condition  = activeCondition();
+  const thresh     = fluxThreshold();
+  const isBaseline = condition === keio.baseline;   // D-Glucose: show absolute, not delta
+  const W = chart.clientWidth, H = chart.clientHeight;
+  const ML = 170, MR = 170, MT = 62, MB = 24;
+  const innerW = W - ML - MR;
+  const innerH = H - MT - MB;
 
-  const cy = cytoscape({
-    container: document.getElementById('cy'),
-    elements,
-    style: CY_STYLE,
-    layout: { name: 'preset' },
-    minZoom: 0.03, maxZoom: 8,
-    boxSelectionEnabled: false,
-    autoungrabify: false,
+  // ── Base scores (absolute when baseline is selected, delta otherwise) ────
+  const rxnDeltas = {};
+  for (const [id, sc] of Object.entries(keio.reaction_scores)) {
+    const a = sc[condition], b = sc[keio.baseline];
+    if (a != null) rxnDeltas[id] = isBaseline ? a : (b != null ? a - b : null);
+  }
+
+  const geneScores = {};
+  for (const [g, rxns] of Object.entries(gem._geneToRxns)) {
+    const ds = rxns.map(r => rxnDeltas[r]).filter(d => d != null);
+    if (ds.length) geneScores[g] = ds.reduce((a, b) => a + b) / ds.length;
+  }
+
+  const metScores = {};
+  for (const [m, rxns] of Object.entries(gem._metToRxns)) {
+    const ds = rxns.map(r => rxnDeltas[r]).filter(d => d != null);
+    if (ds.length) metScores[m] = ds.reduce((a, b) => a + b) / ds.length;
+  }
+
+  // ── Aggregate per subsystem ──────────────────────────────────────────────
+  const ssMap = {};
+  for (const rxn of gem.reactions) {
+    const sub = rxn.subsystem;
+    if (!sub) continue;
+    const s = ssMap[sub] ??= { genes: new Set(), rxns: [], mets: new Set() };
+    for (const g of gem._rxnToGenes[rxn.id] ?? []) s.genes.add(g);
+    s.rxns.push(rxn.id);
+    for (const m of Object.keys(rxn.metabolites ?? {})) s.mets.add(m);
+  }
+
+  const items = [];
+  for (const [sub, { genes, rxns, mets }] of Object.entries(ssMap)) {
+    if (genes.size < 2) continue;
+    const gd = [...genes].map(g => geneScores[g]).filter(d => d != null);
+    const rd = rxns.map(r => rxnDeltas[r]).filter(d => d != null);
+    const md = [...mets].map(m => metScores[m]).filter(d => d != null);
+    const avg = xs => xs.length ? xs.reduce((a, b) => a + b) / xs.length : 0;
+    const gMean = avg(gd), rMean = avg(rd), mMean = avg(md);
+    const activity = (Math.abs(gMean) + Math.abs(rMean) + Math.abs(mMean)) / 3;
+    items.push({
+      sub,
+      geneCount: genes.size,
+      gMean, rMean, mMean, activity,
+      // layer scores: genome=structural count, others=|mean delta|
+      ls: [genes.size, Math.abs(gMean), Math.abs(rMean), Math.abs(mMean)],
+    });
+  }
+
+  // Sort by overall activity; take top 20
+  items.sort((a, b) => b.activity - a.activity);
+  const vis = items.slice(0, 20);
+
+  // ── Normalize each layer column to fill innerH ───────────────────────────
+  const N = vis.length, NL = 4;
+  const GAP = 3;
+  const availH = innerH - GAP * (N - 1);
+  const totals = Array.from({ length: NL }, (_, li) => vis.reduce((s, d) => s + d.ls[li], 0));
+
+  // positions[si][li] = {y, h}
+  const pos = vis.map(() => Array(NL).fill(null));
+  for (let li = 0; li < NL; li++) {
+    let y = 0;
+    vis.forEach((item, si) => {
+      const h = Math.max(1, (item.ls[li] / (totals[li] || 1)) * availH);
+      pos[si][li] = { y, h };
+      y += h + GAP;
+    });
+  }
+
+  // ── Colours ──────────────────────────────────────────────────────────────
+  // Each subsystem gets a unique hue; block tint shows delta direction
+  const subHue = {};
+  vis.forEach((item, i) => { subHue[item.sub] = Math.round((i / vis.length) * 340); });
+
+  function bandColor(item) {
+    return `hsl(${subHue[item.sub]},60%,52%)`;
+  }
+  function blockFill(item, li) {
+    if (li === 0 || isBaseline) return `hsl(${subHue[item.sub]},55%,48%)`; // identity colour
+    const delta = [null, item.gMean, item.rMean, item.mMean][li];
+    if (Math.abs(delta) < thresh) return '#334155';
+    const t = Math.min(Math.abs(delta) / 2, 1);
+    return delta < 0
+      ? d3.interpolateRgb('#334155', '#ef4444')(t)   // more active → red
+      : d3.interpolateRgb('#334155', '#3b82f6')(t);  // less active → blue
+  }
+
+  // ── Layout constants ─────────────────────────────────────────────────────
+  const COL_W = 20;
+  // Spread 4 columns evenly across innerW, centred on their midpoint
+  const colXs = [0, 1, 2, 3].map(i => ML + i * (innerW / 3));
+  const LABELS  = ['GENOME', 'TRANSCRIPTOME', 'PROTEOME', 'METABOLOME'];
+  const SUBLBLS = isBaseline
+    ? ['gene count', 'gene activity (abs)', 'reaction flux (abs)', 'metabolite flux (abs)']
+    : ['gene count', 'gene activity Δ', 'reaction flux Δ', 'metabolite flux Δ'];
+
+  // ── SVG ──────────────────────────────────────────────────────────────────
+  const svg = d3.create('svg').attr('width', W).attr('height', H);
+  const g   = svg.append('g').attr('transform', `translate(0,${MT})`);
+
+  // Column headers
+  LABELS.forEach((lbl, li) => {
+    g.append('text')
+      .attr('x', colXs[li] + COL_W / 2).attr('y', -36)
+      .attr('text-anchor', 'middle').attr('fill', '#e2e8f0')
+      .attr('font-size', '10.5px').attr('font-weight', '700').attr('letter-spacing', '0.09em')
+      .text(lbl);
+    g.append('text')
+      .attr('x', colXs[li] + COL_W / 2).attr('y', -20)
+      .attr('text-anchor', 'middle').attr('fill', '#475569').attr('font-size', '8.5px')
+      .text(SUBLBLS[li]);
+    // Vertical axis line
+    g.append('line')
+      .attr('x1', colXs[li] + COL_W / 2).attr('y1', -8)
+      .attr('x2', colXs[li] + COL_W / 2).attr('y2', innerH)
+      .attr('stroke', '#1e2533').attr('stroke-width', 1);
   });
 
-  cy.fit(undefined, 40);
+  // Ribbons between adjacent columns (draw under blocks)
+  const rG = g.append('g');
+  for (let li = 0; li < 3; li++) {
+    const x1 = colXs[li] + COL_W, x2 = colXs[li + 1];
+    const mx = (x1 + x2) / 2;
+    vis.forEach((item, si) => {
+      const s = pos[si][li], t = pos[si][li + 1];
+      rG.append('path')
+        .attr('d', `M${x1},${s.y} C${mx},${s.y} ${mx},${t.y} ${x2},${t.y}
+                    L${x2},${t.y+t.h} C${mx},${t.y+t.h} ${mx},${s.y+s.h} ${x1},${s.y+s.h} Z`)
+        .attr('fill', bandColor(item))
+        .attr('opacity', 0.18);
+    });
+  }
 
-  // ── Tooltips ────────────────────────────────────────────────────────────────
+  // Blocks + labels + tooltips
   const tooltip = document.getElementById('tooltip');
+  vis.forEach((item, si) => {
+    for (let li = 0; li < NL; li++) {
+      const { y, h } = pos[si][li];
+      g.append('rect')
+        .attr('x', colXs[li]).attr('y', y)
+        .attr('width', COL_W).attr('height', Math.max(1, h))
+        .attr('fill', blockFill(item, li)).attr('rx', 2).attr('cursor', 'pointer')
+        .on('mouseover', event => {
+          const lbl = isBaseline ? '' : 'Δ ';
+          const fmt = v => (v >= 0 ? '+' : '') + v.toFixed(3);
+          tooltip.style.display = 'block';
+          tooltip.innerHTML = `<strong>${item.sub}</strong>
+            <div class="sub">${item.geneCount} genes${isBaseline ? ' — absolute flux' : ''}</div>
+            Gene&thinsp;${lbl}${fmt(item.gMean)}<br>
+            Rxn&thinsp;${lbl}&nbsp;&nbsp;${fmt(item.rMean)}<br>
+            Met&thinsp;${lbl}&nbsp;&nbsp;${fmt(item.mMean)}`;
+        })
+        .on('mousemove', e => { tooltip.style.left = (e.clientX+14)+'px'; tooltip.style.top = (e.clientY-12)+'px'; })
+        .on('mouseout',  () => { tooltip.style.display = 'none'; });
+    }
 
-  cy.on('mouseover', 'node[type="met"]', e => {
-    const d = e.target.data();
-    tooltip.style.display = 'block';
-    tooltip.innerHTML = `
-      <strong>${d.name}</strong><br>BiGG: ${d.bigg_id}<br>
-      Compartment: ${COMP_NAMES[d.comp] ?? d.comp}
-      ${d.formula ? `<br>Formula: ${d.formula}` : ''}`;
+    // Left-side label (anchored to genome column)
+    const lp = pos[si][0];
+    if (lp.h >= 5) {
+      g.append('text')
+        .attr('x', colXs[0] - 6).attr('y', lp.y + lp.h / 2 + 3.5)
+        .attr('text-anchor', 'end').attr('fill', '#94a3b8').attr('font-size', '9.5px')
+        .text(item.sub.length > 30 ? item.sub.slice(0, 29) + '…' : item.sub);
+    }
+
+    // Right-side label (anchored to metabolome column)
+    const rp = pos[si][3];
+    if (rp.h >= 5) {
+      g.append('text')
+        .attr('x', colXs[3] + COL_W + 6).attr('y', rp.y + rp.h / 2 + 3.5)
+        .attr('text-anchor', 'start').attr('fill', '#94a3b8').attr('font-size', '9.5px')
+        .text(item.sub.length > 30 ? item.sub.slice(0, 29) + '…' : item.sub);
+    }
   });
 
-  cy.on('mouseover', 'node[type="rxn"]', e => {
-    const d   = e.target.data();
-    const rxnObj = rxnLookup()[d.bigg_id];
-    tooltip.style.display = 'block';
-    tooltip.innerHTML = `
-      <strong>${d.name}</strong><br>ID: ${d.bigg_id}
-      ${rxnObj?.gene_reaction_rule ? `<div class="sub">Genes: ${rxnObj.gene_reaction_rule}</div>` : ''}
-      ${fluxMode ? fluxLabel(d.delta) : ''}`;
-  });
-
-  cy.on('mousemove', e => {
-    tooltip.style.left = (e.originalEvent.clientX + 14) + 'px';
-    tooltip.style.top  = (e.originalEvent.clientY - 12) + 'px';
-  });
-  cy.on('mouseout', 'node', () => { tooltip.style.display = 'none'; });
-
-  // Highlight neighbours on click
-  cy.on('tap', 'node', e => {
-    cy.elements().removeClass('highlighted faded');
-    const node = e.target;
-    const hood = node.closedNeighborhood();
-    hood.addClass('highlighted');
-    cy.elements().not(hood).addClass('faded');
-  });
-  cy.on('tap', e => {
-    if (e.target === cy) cy.elements().removeClass('highlighted faded');
-  });
+  chart.appendChild(svg.node());
 }
 
 init();

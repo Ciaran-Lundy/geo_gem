@@ -83,6 +83,7 @@ const PROPERTY_LABELS: Record<keyof typeof PROPERTY_IDS, string> = {
     GENE_REACTION_RULE: "Gene Reaction Rule",
     STOICHIOMETRY: "Stoichiometry",
     ORGANISM: "Organism",
+    SUBSYSTEM_NAME: "Subsystem Name",
 };
 
 const PROPERTY_DATATYPES: Record<keyof typeof PROPERTY_IDS, "TEXT" | "FLOAT"> = {
@@ -96,6 +97,7 @@ const PROPERTY_DATATYPES: Record<keyof typeof PROPERTY_IDS, "TEXT" | "FLOAT"> = 
     GENE_REACTION_RULE: "TEXT",
     STOICHIOMETRY: "FLOAT",
     ORGANISM: "TEXT",
+    SUBSYSTEM_NAME: "TEXT",
 };
 
 const RELATION_LABELS: Record<keyof typeof RELATION_TYPE_IDS, string> = {
@@ -119,6 +121,7 @@ const TYPE_PROPERTIES: Record<keyof typeof ENTITY_TYPE_IDS, string[]> = {
         PROPERTY_IDS.LOWER_BOUND,
         PROPERTY_IDS.UPPER_BOUND,
         PROPERTY_IDS.GENE_REACTION_RULE,
+        PROPERTY_IDS.SUBSYSTEM_NAME,
         PROPERTY_IDS.ORGANISM,
     ],
     GENE: [PROPERTY_IDS.BIGG_ID, PROPERTY_IDS.ORGANISM],
@@ -297,6 +300,9 @@ export function generateOps(): GenerateResult {
         ];
         if (rxn.gene_reaction_rule) {
             values.push({ property: PROPERTY_IDS.GENE_REACTION_RULE, type: "text", value: rxn.gene_reaction_rule });
+        }
+        if (rxn.subsystem) {
+            values.push({ property: PROPERTY_IDS.SUBSYSTEM_NAME, type: "text", value: rxn.subsystem });
         }
 
         // Build inline relations: PART_OF subsystem + CATALYSED_BY gene(s)

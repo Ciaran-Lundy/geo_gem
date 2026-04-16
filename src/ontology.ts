@@ -31,6 +31,7 @@ export const PROPERTY_IDS = {
     GENE_REACTION_RULE: makeId("attr:gene_reaction_rule"),
     STOICHIOMETRY: makeId("attr:stoichiometry"),
     ORGANISM: makeId("attr:organism"),
+    SUBSYSTEM_NAME: makeId("attr:subsystem_name"),
 } as const;
 
 // ── Relation Type IDs (defined as RELATION-typed properties in geo-sdk) ──────

@@ -11,10 +11,9 @@ node_modules/
                        
 # Data files — large, generated, or sensitive
 data/iml1515.json
-data/keio_perturbations.json
-data/entity_id_map.json            
+data/entity_id_map.json
 data/publish_log.json
-data/escher_maps/
+# keio_perturbations.json and escher_maps/ are tracked for GitHub Pages
                        
 # Temp files from the SBML download
 /tmp/
