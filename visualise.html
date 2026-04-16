@@ -190,21 +190,29 @@ async function geoGql(query) {
   return data;
 }
 
-// Fetch all pages of a given entity type in parallel (count + first page together).
+// Fetch all entities of a given type using cursor-based pagination.
+// The API caps both `first` and `offset` at 1000, so offset pagination breaks
+// for large collections (reactions: 2712+). Cursor pagination has no such limit.
 async function fetchGeoPages(typeId, fields, batchSize = 500) {
-  const [countRes, firstRes] = await Promise.all([
-    geoGql(`{ entitiesConnection(spaceId:"${GEO_SPACE}", typeId:"${typeId}") { totalCount } }`),
-    geoGql(`{ entities(spaceId:"${GEO_SPACE}", typeId:"${typeId}", first:${batchSize}, offset:0) { ${fields} } }`),
-  ]);
-  const total = countRes.entitiesConnection.totalCount;
-  const pages = Math.ceil(total / batchSize);
-  if (pages <= 1) return { total, entities: firstRes.entities };
-  const rest = await Promise.all(
-    Array.from({ length: pages - 1 }, (_, i) =>
-      geoGql(`{ entities(spaceId:"${GEO_SPACE}", typeId:"${typeId}", first:${batchSize}, offset:${(i + 1) * batchSize}) { ${fields} } }`)
-    )
-  );
-  return { total, entities: [...firstRes.entities, ...rest.flatMap(r => r.entities)] };
+  const connQuery = (after) =>
+    geoGql(`{ entitiesConnection(spaceId:"${GEO_SPACE}", typeId:"${typeId}", first:${batchSize}${after ? `, after:"${after}"` : ''}) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      edges { node { ${fields} } }
+    } }`);
+
+  const firstPage = await connQuery(null);
+  const total = firstPage.entitiesConnection.totalCount;
+  const entities = firstPage.entitiesConnection.edges.map(e => e.node);
+  let { hasNextPage, endCursor } = firstPage.entitiesConnection.pageInfo;
+
+  while (hasNextPage) {
+    const page = await connQuery(endCursor);
+    entities.push(...page.entitiesConnection.edges.map(e => e.node));
+    ({ hasNextPage, endCursor } = page.entitiesConnection.pageInfo);
+  }
+
+  return { total, entities };
 }
 
 function setStatus(msg) {
